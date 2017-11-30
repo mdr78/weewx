@@ -24,14 +24,18 @@ import operator
 import syslog
 
 import serial
-
 import weewx.drivers
+import collections
 
 from math import exp
 
 DRIVER_NAME = 'WMR9x8'
 DRIVER_VERSION = "3.2.2"
 DEFAULT_PORT = '/dev/ttyS0'
+
+# pstart, plen is payload start and len positions
+# cstart, clen is checksum start and len positions
+ModelSettings = collections.namedtuple('ModelSettings', 'pstart plen cstart clen csum')
 
 def loader(config_dict, engine):  # @UnusedVariable
     return WMR9x8(**config_dict[DRIVER_NAME])
@@ -64,14 +68,38 @@ def channel_decoder(chan):
         raise WMR9x8ProtocolError("Bad channel number %d" % chan)
     return outchan
 
+def get_nibble_data(packet):
+    nibbles = bytearray()
+    for byte in packet:
+        nibbles.extend([(byte & 0x0F), (byte & 0xF0) >> 4])
+    return nibbles
+
+def checksum(vals, settings):
+    return reduce(operator.add, pdata[0:-1]) & 0xFF
+
+def checksum_wmr89(vals, settings):
+    checksum = reduce(operator.add, get_nibble_data(vals[settings.cstart:settings.clen])) & 0xFF
+
+    return (checksum & 0x0F) << 4 | (checksum & 0xF0) >> 4
+
 # Dictionary that maps a measurement code, to a function that can decode it:
 # packet_type_decoder_map and packet_type_size_map are filled out using the @<type>_registerpackettype
 # decorator below
+wmr89_packet_type_decoder_map = {}
+wmr89_packet_type_size_map = {}
+
 wmr9x8_packet_type_decoder_map = {}
 wmr9x8_packet_type_size_map = {}
 
 wm918_packet_type_decoder_map = {}
 wm918_packet_type_size_map = {}
+
+# Model spefic settings describing the payload and the checksum.
+model_settings = {   
+                "wmr9x8" : ModelSettings(pstart = 2, plen = None, cstart = 0 ,clen = -1, csum=checksum),
+                "wmr89": ModelSettings(pstart = 2, plen = -2, cstart = 0, clen = -2, csum=checksum_wmr89),
+                "wm918" : ModelSettings(pstart = 0, plen = None, cstart = 0, clen = -1, csum=checksum)
+                }
 
 def wmr9x8_registerpackettype(typecode, size):
     """ Function decorator that registers the function as a handler
@@ -80,6 +108,15 @@ def wmr9x8_registerpackettype(typecode, size):
     def wrap(dispatcher):
         wmr9x8_packet_type_decoder_map[typecode] = dispatcher
         wmr9x8_packet_type_size_map[typecode] = size
+    return wrap
+
+def wmr89_registerpackettype(sensorcode, size):
+    """ Function decorator that registers the function as a handler
+        for a particular packet type.  Parameters to the decorator
+        are sensorcode. """
+    def wrap(dispatcher):
+        wmr89_packet_type_decoder_map[sensorcode] = dispatcher
+        wmr89_packet_type_size_map[sensorcode] = size
     return wrap
 
 def wm918_registerpackettype(typecode, size):
@@ -95,7 +132,7 @@ def wm918_registerpackettype(typecode, size):
 class SerialWrapper(object):
     """Wraps a serial connection returned from package serial"""
 
-    def __init__(self, port):
+    def __init__(self, port, baudrate):
         self.port = port
         # WMR9x8 specific settings
         self.serialconfig = {
@@ -103,7 +140,8 @@ class SerialWrapper(object):
             "parity": serial.PARITY_NONE,
             "stopbits": serial.STOPBITS_ONE,
             "timeout": None,
-            "rtscts": 1
+            "rtscts": 1,
+            "baudrate": baudrate,
         }
 
     def flush_input(self):
@@ -202,7 +240,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
         model: Which station model is this?
         [Optional. Default is 'WMR968']
 
-        port: The serial port of the WM918/WMR918/WMR968.
+        port: The serial port of the WMR89/WMR918/WMR968.
         [Required if serial communication]
 
         baudrate: Baudrate of the port.
@@ -240,65 +278,79 @@ class WMR9x8(weewx.drivers.AbstractDevice):
         self.port.closePort()
 
     def genLoopPackets(self):
-        """Generator function that continuously returns loop packets"""
+
+        preambleBufSize = 3
+        preambleBuf = []
         buf = []
-        # We keep a buffer the size of the largest supported packet
-        wmr9x8max = max(wmr9x8_packet_type_size_map.items(), key=operator.itemgetter(1))[1]
-        wm918max = max(wm918_packet_type_size_map.items(), key=operator.itemgetter(1))[1]
-        preBufferSize = max(wmr9x8max, wm918max)
+
+        """Generator function that continuously returns loop packets"""
+
         while True:
-            buf.extend(map(ord, self.port.read(preBufferSize - len(buf))))
-            # WMR-9x8/968 packets are framed by 0xFF characters
-            if buf[0] == 0xFF and buf[1] == 0xFF and buf[2] in wmr9x8_packet_type_size_map:
-                # Look up packet type, the expected size of this packet type
-                ptype = buf[2]
-                psize = wmr9x8_packet_type_size_map[ptype]
-                # Capture only the data belonging to this packet
-                pdata = buf[0:psize]
-                if weewx.debug >= 2:
-                    self.log_packet(pdata)
-                # Validate the checksum
-                sent_checksum = pdata[-1]
-                calc_checksum = reduce(operator.add, pdata[0:-1]) & 0xFF
-                if sent_checksum == calc_checksum:
-                    logdbg("Received WMR9x8 data packet.")
-                    payload = pdata[2:-1]
-                    _record = wmr9x8_packet_type_decoder_map[ptype](self, payload)
-                    _record = self._sensors_to_fields(_record, self.sensor_map)
-                    if _record is not None:
-                        yield _record
-                    # Eliminate all packet data from the buffer
-                    buf = buf[psize:]
-                else:
-                    logdbg("Invalid data packet (%s)." % pdata)
-                    # Drop the first byte of the buffer and start scanning again
-                    buf.pop(0)
-            # WM-918 packets have no framing
+            preambleBuf.extend(map(ord, self.port.read(preambleBufSize - len(preambleBuf))))
+
+            psize = 0
+            if preambleBuf[0] == 0xFF and preambleBuf[1] == 0xFF and preambleBuf[2] in wmr9x8_packet_type_size_map:
+                logdbg("Received WMR9x8 data packet.")
+                
+                ptype = preambleBuf[2]
+            	psize = wmr9x8_packet_type_size_map[preambleBuf[2]]
+                decoder = wmr9x8_packet_type_decoder_map
+                settings = model_settings["wmr9x8"]
+
+            elif ((preambleBuf[0] * 0x100) + preambleBuf[1]) in wmr89_packet_type_decoder_map:
+                logdbg("Recieved WMR89a data packet.")
+                
+                ptype = (preambleBuf[0] * 0x100) + preambleBuf[1]
+		psize = wmr89_packet_type_size_map[ptype]
+                decoder = wmr89_packet_type_decoder_map
+                settings = model_settings["wmr89"]
+
+                #wmr89a checksum differs in it doesn't include the first nibble in the sum.
+                preambleBuf[0] = preambleBuf[0] & 0x0F
+
             elif buf[0] in wm918_packet_type_size_map:
-                # Look up packet type, the expected size of this packet type
-                ptype = buf[0]
+                logdbg("Received WM-918 data packet.")
+                
+                ptype = preambleBuf[0]
                 psize = wm918_packet_type_size_map[ptype]
-                # Capture only the data belonging to this packet
-                pdata = buf[0:psize]
-                # Validate the checksum
-                sent_checksum = pdata[-1]
-                calc_checksum = reduce(operator.add, pdata[0:-1]) & 0xFF
-                if sent_checksum == calc_checksum:
-                    logdbg("Received WM-918 data packet.")
-                    payload = pdata[0:-1] # send all of packet but crc
-                    _record = wm918_packet_type_decoder_map[ptype](self, payload)
-                    _record = self._sensors_to_fields(_record, self.sensor_map)
-                    if _record is not None:
-                        yield _record
-                    # Eliminate all packet data from the buffer
-                    buf = buf[psize:]
-                else:
-                    logdbg("Invalid data packet (%s)." % pdata)
-                    # Drop the first byte of the buffer and start scanning again
-                    buf.pop(0)
+                decoder = wm918_packet_type_decoder_map
+                settings = model_settings["wm918"]
+
             else:
-                logdbg("Advancing buffer by one for the next potential packet")
-                buf.pop(0)
+		logdbg("Invalid data packet")
+		preambleBuf.pop(0)
+		continue
+            
+            #At this point the rest of the packet should be waiting to be read.
+            #Only read to the length of the packet, leave the rest in the serial buf. 
+            buf = preambleBuf
+            buf.extend(map(ord, self.port.read(psize - len(preambleBuf))))
+
+            preambleBuf = []
+
+            if weewx.debug >= 2:
+                self.log_packet(buf)
+
+            # Validate the checksum
+            sent_checksum = buf[settings.clen]
+            calc_checksum = settings.csum(buf, settings)
+
+            if sent_checksum == calc_checksum:
+                logdbg("Received data packet.")
+                if weewx.debug >= 2:
+                    logdbg("nibbles:" + ",".join("0x{:01x}".format(n) for n in get_nibble_data(buf[:])))
+
+                payload = buf[settings.pstart:settings.plen]
+                _record = decoder[ptype](self, payload)
+                _record = self._sensors_to_fields(_record, self.sensor_map)
+
+                if _record is not None:
+                    yield _record
+                # Eliminate all packet data from the buffer
+                buf = []
+            else:
+                logdbg("Invalid data packet (%s)." % buf)
+                # Drop the first byte of the buffer and start scanning again
 
     @staticmethod
     def _sensors_to_fields(oldrec, sensor_map):
@@ -327,24 +379,78 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
         if connection_type == "serial":
             port = stn_dict['port']
-            return SerialWrapper(port)
+            baudrate = stn_dict['baudrate']
+            return SerialWrapper(port, baudrate)
         raise weewx.UnsupportedFeature(stn_dict['type'])
 
-    @staticmethod
-    def _get_nibble_data(packet):
-        nibbles = bytearray()
-        for byte in packet:
-            nibbles.extend([(byte & 0x0F), (byte & 0xF0) >> 4])
-        return nibbles
 
     def log_packet(self, packet):
-        packet_str = ','.join(["x%x" % v for v in packet])
+        packet_str = ','.join(["{:02x}".format(v) for v in packet])
         print "%d, %s, %s" % (int(time.time() + 0.5), time.asctime(), packet_str)
+
+    @wmr89_registerpackettype(sensorcode=0xA198, size=11)
+    def _wmr89_wind_packet(self, packet):
+        """Decode a wind packet. Wind speed will be in kph"""
+        chan, null, null, status, dir1, null, null, gust10, gust1, gust10th, avg10th, avg10, null, avg1 = get_nibble_data(packet[:])
+
+        battery = (status & 0x04) >> 2
+
+        # The console returns wind speeds in m/s. Our metric system requires
+        # kph, so the result needs to be multiplied by 3.6
+        _record = {
+            'battery_status_wind': battery,
+            'wind_speed': ((avg10th / 10.0) + avg1 + (avg10 * 10)) * 3.6,
+            'wind_dir': (dir1 & 0x0f) * 360.0 / 16.0,
+            'dateTime': int(time.time() + 0.5),
+            'usUnits': weewx.METRIC
+        }
+        # Sometimes the station emits a wind gust that is less than the
+        # average wind. Ignore it if this is the case.
+        windGustSpeed = ((gust10th / 10.0) + gust1 + (gust10 * 10)) * 3.6
+        if windGustSpeed >= _record['wind_speed']:
+            _record['wind_gust'] = windGustSpeed
+
+        # Bit 1 of chillstatus is on if there is no wind chill data;
+        # Bit 2 is on if it has overflowed. Check them both:
+        #if chillstatus & 0x6 == 0:
+        #    chill = chill1 + (10 * chill10)
+        #    if chillstatus & 0x8:
+        #        chill = -chill
+        #    _record['windchill'] = chill
+        #else:
+        #    _record['windchill'] = None
+        
+        return _record
+
+    @wmr89_registerpackettype(sensorcode=0xaf82, size=10)
+    def _wmr89_thermohydro_packet(self, packet):
+        chan, null, null, status, temp10th, temp100etc, temp10, temp1, hum1, null, null, hum10 = get_nibble_data(packet[:])
+
+        chan = channel_decoder(chan)
+
+        battery = (status & 0x04) >> 2
+        _record = {
+            'dateTime': int(time.time() + 0.5),
+            'usUnits': weewx.METRIC,
+            'battery_status_%d' % chan :battery
+        }
+
+        #_record['humidity_%d' % chan] = hum1 + (hum10 * 10)
+        _record['humidity_out'] = hum1 + (hum10 * 10)
+
+        temp = (temp10th / 10.0) + temp1 + (temp10 * 10) 
+        #((temp100etc & 0x03) * 100)
+        if temp100etc & 0x08:
+            temp = -temp
+        #_record['temperature_%d' % chan] = temp
+        _record['temperature_out'] = temp
+
+        return _record
 
     @wmr9x8_registerpackettype(typecode=0x00, size=11)
     def _wmr9x8_wind_packet(self, packet):
         """Decode a wind packet. Wind speed will be in kph"""
-        null, status, dir1, dir10, dir100, gust10th, gust1, gust10, avg10th, avg1, avg10, chillstatus, chill1, chill10 = self._get_nibble_data(packet[1:]) # @UnusedVariable
+        null, status, dir1, dir10, dir100, gust10th, gust1, gust10, avg10th, avg1, avg10, chillstatus, chill1, chill10 = get_nibble_data(packet[1:]) # @UnusedVariable
 
         battery = (status & 0x04) >> 2
 
@@ -377,7 +483,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wmr9x8_registerpackettype(typecode=0x01, size=16)
     def _wmr9x8_rain_packet(self, packet):
-        null, status, cur1, cur10, cur100, tot10th, tot1, tot10, tot100, tot1000, yest1, yest10, yest100, yest1000, totstartmin1, totstartmin10, totstarthr1, totstarthr10, totstartday1, totstartday10, totstartmonth1, totstartmonth10, totstartyear1, totstartyear10 = self._get_nibble_data(packet[1:]) # @UnusedVariable
+        null, status, cur1, cur10, cur100, tot10th, tot1, tot10, tot100, tot1000, yest1, yest10, yest100, yest1000, totstartmin1, totstartmin10, totstarthr1, totstarthr10, totstartday1, totstartday10, totstartmonth1, totstartmonth10, totstartyear1, totstartyear10 = get_nibble_data(packet[1:]) # @UnusedVariable
         battery = (status & 0x04) >> 2
 
         # station units are mm and mm/hr while the internal metric units are
@@ -399,7 +505,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wmr9x8_registerpackettype(typecode=0x02, size=9)
     def _wmr9x8_thermohygro_packet(self, packet):
-        chan, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10 = self._get_nibble_data(packet[1:])
+        chan, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10 = get_nibble_data(packet[1:])
 
         chan = channel_decoder(chan)
 
@@ -430,7 +536,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wmr9x8_registerpackettype(typecode=0x03, size=9)
     def _wmr9x8_mushroom_packet(self, packet):
-        _, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10 = self._get_nibble_data(packet[1:])
+        _, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10 = get_nibble_data(packet[1:])
 
         battery = (status & 0x04) >> 2
         _record = {
@@ -458,7 +564,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wmr9x8_registerpackettype(typecode=0x04, size=7)
     def _wmr9x8_therm_packet(self, packet):
-        chan, status, temp10th, temp1, temp10, temp100etc = self._get_nibble_data(packet[1:])
+        chan, status, temp10th, temp1, temp10, temp100etc = get_nibble_data(packet[1:])
 
         chan = channel_decoder(chan)
         battery = (status & 0x04) >> 2
@@ -477,7 +583,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wmr9x8_registerpackettype(typecode=0x05, size=13)
     def _wmr9x8_in_thermohygrobaro_packet(self, packet):
-        null, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10, baro1, baro10, wstatus, null2, slpoff10th, slpoff1, slpoff10, slpoff100 = self._get_nibble_data(packet[1:]) # @UnusedVariable
+        null, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10, baro1, baro10, wstatus, null2, slpoff10th, slpoff1, slpoff10, slpoff100 = get_nibble_data(packet[1:]) # @UnusedVariable
 
         battery = (status & 0x04) >> 2
         hum = hum1 + (hum10 * 10)
@@ -516,7 +622,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wmr9x8_registerpackettype(typecode=0x06, size=14)
     def _wmr9x8_in_ext_thermohygrobaro_packet(self, packet):
-        null, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10, baro1, baro10, baro100, wstatus, null2, slpoff10th, slpoff1, slpoff10, slpoff100, slpoff1000 = self._get_nibble_data(packet[1:]) # @UnusedVariable
+        null, status, temp10th, temp1, temp10, temp100etc, hum1, hum10, dew1, dew10, baro1, baro10, baro100, wstatus, null2, slpoff10th, slpoff1, slpoff10, slpoff100, slpoff1000 = get_nibble_data(packet[1:]) # @UnusedVariable
 
         battery = (status & 0x04) >> 2
         hum = hum1 + (hum10 * 10)
@@ -556,7 +662,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
     def _wmr9x8_time_packet(self, packet):
         """The (partial) time packet is not used by weewx.
         However, the last time is saved in case getTime() is called."""
-        min1, min10 = self._get_nibble_data(packet[1:])
+        min1, min10 = get_nibble_data(packet[1:])
         minutes = min1 + ((min10 & 0x07) * 10)
 
         cur = time.gmtime()
@@ -570,7 +676,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
     def _wmr9x8_clock_packet(self, packet):
         """The clock packet is not used by weewx.
         However, the last time is saved in case getTime() is called."""
-        min1, min10, hour1, hour10, day1, day10, month1, month10, year1, year10 = self._get_nibble_data(packet[1:])
+        min1, min10, hour1, hour10, day1, day10, month1, month10, year1, year10 = get_nibble_data(packet[1:])
         year = year1 + (year10 * 10)
         # The station initializes itself to "1999" as the first year
         # Thus 99 = 1999, 00 = 2000, 01 = 2001, etc.
@@ -590,8 +696,8 @@ class WMR9x8(weewx.drivers.AbstractDevice):
     @wm918_registerpackettype(typecode=0xcf, size=27)
     def _wm918_wind_packet(self, packet):
         """Decode a wind packet. Wind speed will be in m/s"""
-        gust10th, gust1, gust10, dir1, dir10, dir100, avg10th, avg1, avg10, avgdir1, avgdir10, avgdir100 = self._get_nibble_data(packet[1:7])
-        _chill10, _chill1 = self._get_nibble_data(packet[16:17])
+        gust10th, gust1, gust10, dir1, dir10, dir100, avg10th, avg1, avg10, avgdir1, avgdir10, avgdir100 = get_nibble_data(packet[1:7])
+        _chill10, _chill1 = get_nibble_data(packet[16:17])
 
         # The console returns wind speeds in m/s. Our metric system requires
         # kph, so the result needs to be multiplied by 3.6
@@ -611,7 +717,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wm918_registerpackettype(typecode=0xbf, size=14)
     def _wm918_rain_packet(self, packet):
-        cur1, cur10, cur100, _stat, yest1, yest10, yest100, yest1000, tot1, tot10, tot100, tot1000 = self._get_nibble_data(packet[1:7])
+        cur1, cur10, cur100, _stat, yest1, yest10, yest100, yest1000, tot1, tot10, tot100, tot1000 = get_nibble_data(packet[1:7])
 
         # It is reported that total rainfall is biased by +0.5 mm
         _record = {
@@ -634,8 +740,8 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wm918_registerpackettype(typecode=0x8f, size=35)
     def _wm918_humidity_packet(self, packet):
-        hum1, hum10 = self._get_nibble_data(packet[8:9])
-        humout1, humout10 = self._get_nibble_data(packet[20:21])
+        hum1, hum10 = get_nibble_data(packet[8:9])
+        humout1, humout10 = get_nibble_data(packet[20:21])
 
         hum = hum1 + (hum10 * 10)
         humout = humout1 + (humout10 * 10)
@@ -649,8 +755,8 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wm918_registerpackettype(typecode=0x9f, size=34)
     def _wm918_therm_packet(self, packet):
-        temp10th, temp1, temp10, null = self._get_nibble_data(packet[1:3]) # @UnusedVariable
-        tempout10th, tempout1, tempout10, null = self._get_nibble_data(packet[16:18]) # @UnusedVariable
+        temp10th, temp1, temp10, null = get_nibble_data(packet[1:3]) # @UnusedVariable
+        tempout10th, tempout1, tempout10, null = get_nibble_data(packet[16:18]) # @UnusedVariable
 
         temp = (temp10th / 10.0) + temp1 + ((temp10 & 0x7) * 10)
         temp *= -1 if (temp10 & 0x08) else 1
@@ -667,8 +773,8 @@ class WMR9x8(weewx.drivers.AbstractDevice):
 
     @wm918_registerpackettype(typecode=0xaf, size=31)
     def _wm918_baro_dew_packet(self, packet):
-        baro1, baro10, baro100, baro1000, slp10th, slp1, slp10, slp100, slp1000, fmt, prediction, trend, dewin1, dewin10 = self._get_nibble_data(packet[1:8]) # @UnusedVariable
-        dewout1, dewout10 = self._get_nibble_data(packet[18:19]) # @UnusedVariable
+        baro1, baro10, baro100, baro1000, slp10th, slp1, slp10, slp100, slp1000, fmt, prediction, trend, dewin1, dewin10 = get_nibble_data(packet[1:8]) # @UnusedVariable
+        dewout1, dewout10 = get_nibble_data(packet[18:19]) # @UnusedVariable
 
         #dew = dewin1 + (dewin10 * 10)
         #dewout = dewout1 + (dewout10 *10)
