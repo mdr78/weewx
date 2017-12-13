@@ -78,7 +78,10 @@ def checksum(vals, settings):
     return reduce(operator.add, pdata[0:-1]) & 0xFF
 
 def checksum_wmr89(vals, settings):
-    checksum = reduce(operator.add, get_nibble_data(vals[settings.cstart:settings.clen])) & 0xFF
+
+    #wmr89a checksum differs in it doesn't include the first nibble in the sum of nibbles
+    checksum = reduce(operator.add, 
+            get_nibble_data(vals[settings.cstart:settings.clen])[1:]) & 0xFF
 
     return (checksum & 0x0F) << 4 | (checksum & 0xF0) >> 4
 
@@ -305,8 +308,7 @@ class WMR9x8(weewx.drivers.AbstractDevice):
                 decoder = wmr89_packet_type_decoder_map
                 settings = model_settings["wmr89"]
 
-                #wmr89a checksum differs in it doesn't include the first nibble in the sum.
-                preambleBuf[0] = preambleBuf[0] & 0x0F
+                #preambleBuf[0] = preambleBuf[0] & 0x0F
 
             elif buf[0] in wm918_packet_type_size_map:
                 logdbg("Received WM-918 data packet.")
@@ -410,41 +412,33 @@ class WMR9x8(weewx.drivers.AbstractDevice):
         if windGustSpeed >= _record['wind_speed']:
             _record['wind_gust'] = windGustSpeed
 
-        # Bit 1 of chillstatus is on if there is no wind chill data;
-        # Bit 2 is on if it has overflowed. Check them both:
-        #if chillstatus & 0x6 == 0:
-        #    chill = chill1 + (10 * chill10)
-        #    if chillstatus & 0x8:
-        #        chill = -chill
-        #    _record['windchill'] = chill
-        #else:
-        #    _record['windchill'] = None
-        
         return _record
 
     @wmr89_registerpackettype(sensorcode=0xaf82, size=10)
     def _wmr89_thermohydro_packet(self, packet):
-        chan, null, null, status, temp10th, temp100etc, temp10, temp1, hum1, null, null, hum10 = get_nibble_data(packet[:])
+        chan, null, null, status, temp10th, null, temp10, temp1, hum1, temp100etc, null, hum10 = get_nibble_data(packet[:])
 
         chan = channel_decoder(chan)
 
         battery = (status & 0x04) >> 2
+
         _record = {
             'dateTime': int(time.time() + 0.5),
             'usUnits': weewx.METRIC,
             'battery_status_%d' % chan :battery
         }
 
-        #_record['humidity_%d' % chan] = hum1 + (hum10 * 10)
         _record['humidity_out'] = hum1 + (hum10 * 10)
 
-        temp = (temp10th / 10.0) + temp1 + (temp10 * 10) 
-        #((temp100etc & 0x03) * 100)
-        if temp100etc & 0x08:
-            temp = -temp
-        #_record['temperature_%d' % chan] = temp
-        _record['temperature_out'] = temp
-
+        tempoverunder = temp100etc & 0x04
+        if not tempoverunder:
+            temp = (temp10th / 10.0) + temp1 + (temp10 * 10) + ((temp100etc & 0x03) * 100)
+            if temp100etc & 0x08:
+                temp = -temp
+            _record['temperature_out'] = temp
+        else:
+            _record['temperature_out'] = None
+        
         return _record
 
     @wmr9x8_registerpackettype(typecode=0x00, size=11)
