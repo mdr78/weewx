@@ -1,8 +1,9 @@
 // Modified for use with the WeeWX and the WMR89a - Ray Kinsella
-//  - Modified the interrupt algorithim to make it robust (interrupt safe).
+//  - Check for the sync bits and then remove. 
+//  - Modified the interrupt handler to make it robust (interrupt safe).
 //  - Added flexibily so bitstream length can vary with the sensor.
 //  - Output to serial in binary, removes the need to do nasty string conversion.
-//  - Finally fixed the bit ordering in the serial output. 
+//  - Fixed the bit ordering in the serial output. 
 // Oregon V2 decoder added - Dominique Pierre
 // Oregon V3 decoder revisited - Dominique Pierre
 // New code to decode OOK signals from weather sensors, etc.
@@ -10,8 +11,15 @@
 // 2010-04-11 <jcw@equi4.com> http://opensource.org/licenses/mit-license.php
 // $Id: ookDecoder.pde 5331 2010-04-17 10:45:17Z jcw $
 
+// Define OUTPUT_ASCII to debug on arduino serial console. 
 //#define OUTPUT_ASCII
 #define OUTPUT_LEDS
+
+// Decoding algorthim uses the change from continuous bit flipping (all 1s)
+// to the a constant flip bit (gives 1010) to detect the start of real sensor data.
+// This has the effect of capturing the sync bits, as though it where useful data.
+#define IGNORE_SYNC_BITS
+#define NUMBER_OF_SYNC_BITS 4
 
 class BoardLEDs {
 private:
@@ -74,7 +82,7 @@ public:
 class DecodeOOK {
 protected:
 
-    byte total_bits, bits, bitlen, flip, state, pos, data[25];
+    byte total_bits, bits, bitlen, flip, state, pos, syncbits, data[25];
 
     virtual char decode (word width) =0;
     
@@ -103,25 +111,11 @@ public:
     
     void resetDecoder () {
         bitlen = total_bits = bits = pos = flip = 0;
+        syncbits = NUMBER_OF_SYNC_BITS;
         state = UNKNOWN;
     }
-    
-    // add one bit to the packet data buffer
-    
-    virtual void gotBit (char value) {
-        total_bits++;
-        byte *ptr = data + pos;
-        *ptr = (*ptr >> 1) | (value << 7);
-
-        if (++bits >= 8) {
-            bits = 0;
-            if (++pos >= sizeof data) {
-                resetDecoder();
-                return;
-            }
-        }
-        state = OK;
-    }
+        
+    virtual void gotBit (char value) = 0;
     
     // store a bit using Manchester encoding
     void manchester (char value) {
@@ -174,17 +168,16 @@ class OregonDecoderV3 : public DecodeOOK {
 private:
 
     byte SensorLED;
-    
+
     const byte sensorlookup[3][4] = 
-    { { 0xFA, 0x28, 0x50, 0x00} ,
-      { 0x1A, 0x89, 0x58, 0x01} ,
+    { { 0x8F, 0x42, 0x48, 0x00} , // Sensor ID = F8 24
+      { 0x91, 0x48, 0x50, 0x01} , // Sensor ID = 91 48
       { 0x0, 0x0, 0x0, 0x02}  };
-    
 
     virtual byte lookupLength(byte sensorcode0, byte sensorcode1)
     {
       for(int i = 0; i < 3; i++)
-      {
+      {      
         if( sensorlookup[i][0] == sensorcode0 &&
             sensorlookup[i][1] == sensorcode1)
             {
@@ -201,6 +194,15 @@ public:
     
     // add one bit to the packet data buffer
     virtual void gotBit (char value) {
+#ifdef IGNORE_SYNC_BITS
+        if (syncbits > 0)
+        {
+          syncbits--;
+          state = OK;
+
+          return;
+        }
+#endif
         data[pos] = (data[pos] >> 1) | (value ? 0x80 : 00);
         total_bits++;
         pos = total_bits >> 3;
@@ -218,6 +220,7 @@ public:
                 case UNKNOWN:
                     if (w == 0)
                         ++flip;
+                    // first first long pulse indictates a state transition.
                     else if (32 <= flip) {
                         flip = 1;
                         manchester(1);
@@ -235,7 +238,7 @@ public:
                         manchester(0);
                     else
                         return -1;
-                    break;
+                    break;                   
             }
         } else {
             return -1;
@@ -311,12 +314,18 @@ ISR(ANALOG_COMP_vect) {
 void reportSerial (class DecodeOOK& decoder) {
     byte pos;
     const byte* data = decoder.getData(pos);
+
+    
+
     for (byte i = 0; i < pos; ++i) {
 #ifdef OUTPUT_ASCII
         Serial.print((data[i] & 0x0F), HEX);
         Serial.print(data[i] >> 4, HEX);
 #else 
-        Serial.write((data[i] & 0x0F) << 4 | data[i] >> 4);
+        //Sensor encoding is nibble orientated, but we captured in bytes.
+        //Compensate by output LSB first, then the MSB. 
+        //Serial.write((data[i] & 0x0F) << 4 | data[i] >> 4);
+        Serial.write(data[i]);
 #endif
     }
 
